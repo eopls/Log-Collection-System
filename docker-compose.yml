@@ -1,0 +1,132 @@
+version: "3.8"
+
+services:
+  td-agent:
+    build: ./td-agent
+    container_name: log-collect-td-agent
+    environment:
+      API_BASE: "${API_BASE}"
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      PC_ID: "${PC_ID}"
+      TZ: "${TZ}"
+    volumes:
+      - ./td-agent/td-agent.conf:/etc/td-agent/td-agent.conf:ro
+      - tdpos:/var/log/td-agent
+    ports:
+      - "24224:24224"
+    restart: unless-stopped
+
+  postfix:
+    build: ./postfix
+    container_name: log-collect-postfix
+    environment:
+      TZ: "${TZ}"
+    volumes:
+      - maildir:/opt/mail
+      - postfixlogs:/var/log
+    ports:
+      - "25:25"
+    healthcheck:
+      test: ["CMD-SHELL", "pidof master >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  mail-agent:
+    build: ./mail-agent
+    container_name: log-collect-mail-agent
+    environment:
+      API_BASE: "${API_BASE}"
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      PC_ID: "${PC_ID}"
+      TZ: "${TZ}"
+      MAILDIR_PATH: "/opt/mail/Maildir"
+    volumes:
+      - maildir:/opt/mail
+      - postfixlogs:/host/var/log:ro
+      - mailagentstate:/var/lib/mail-agent
+    depends_on:
+      td-agent:
+        condition: service_started
+      postfix:
+        condition: service_healthy
+    restart: unless-stopped
+    command: /bin/sh -c 'while :; do python /app/mail_script.py; sleep 5; done'
+  
+  proxy-agent:
+    build:
+      context: .
+      dockerfile: ./proxy-agent/Dockerfile
+    container_name: log-collect-proxy-agent
+    environment:
+      API_BASE: "${API_BASE}"
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      PC_ID: "${PC_ID}"
+      TZ: "${TZ}"
+    volumes:
+      - ./mitmproxy:/root/.mitmproxy
+    command: >
+      mitmdump -p 8080
+      -s /app/email_script.py
+      -s /app/http_script.py
+      --set confdir=/root/.mitmproxy
+      --set termlog_verbosity=info --set flow_detail=2
+    ports:
+      - "8081:8080"
+    depends_on:
+      - td-agent
+    restart: unless-stopped
+
+  fix-mail-perm:
+    build: ./fix-mail-perm
+    container_name: fix-mail-perm
+    # Postfix가 쓰는 Maildir 볼륨을 그대로 공유해야 chmod가 적용됨
+    volumes:
+      - maildir:/opt/mail/Maildir
+    restart: unless-stopped
+    # (선택) postfix가 Maildir을 쓴다면 의존성
+    depends_on:
+      - postfix
+
+  cli-wrapper:
+    image: alpine:3.20
+    container_name: log-collect-cli-wrapper
+    depends_on:
+      postfix:
+        condition: service_healthy
+    command:
+      - sh
+      - -lc
+      - |-
+        set -e
+        # 시스템 PATH에 이미 들어있는 /usr/local/bin 에 설치
+        install -d /hostbin
+
+        # 기존 mail이 래퍼가 아니면 백업
+        if [ -f /hostbin/mail ] && ! grep -q 'docker exec -i .* /usr/bin/mailx' /hostbin/mail 2>/dev/null; then
+          cp -f /hostbin/mail "/hostbin/mail.bak.$(date +%s)"
+        fi
+
+        # mailx 래퍼 (★ compose가 $를 치환하지 못하게 $를 $$로 이스케이프)
+        cat >/hostbin/mail <<'EOS'
+        #!/usr/bin/env sh
+        set -eu
+        CTN="$${POSTFIX_CTN:-log-collect-postfix}"
+        exec docker exec -i "$$CTN" /usr/bin/mailx "$$@"
+        EOS
+        chmod +x /hostbin/mail
+
+        echo "Installed /usr/local/bin/mail -> docker exec -i \${POSTFIX_CTN:-log-collect-postfix} /usr/bin/mailx"
+    volumes:
+      - /usr/local/bin:/hostbin
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: "no"
+
+volumes:
+    tdpos:
+      name: logcollect_tdpos
+    maildir: {}
+    postfixlogs:
+      name: logcollect_postfixlogs
+    mailagentstate: {}
