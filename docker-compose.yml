@@ -4,6 +4,7 @@ services:
   td-agent:
     build: ./td-agent
     container_name: log-collect-td-agent
+    user: "0:0"
     environment:
       API_BASE: "${API_BASE}"
       EMPLOYEE_ID: "${EMPLOYEE_ID}"
@@ -12,9 +13,14 @@ services:
     volumes:
       - ./td-agent/td-agent.conf:/etc/td-agent/td-agent.conf:ro
       - tdpos:/var/log/td-agent
+      - /var/log/audit:/host/var/log/audit:ro
+      - /etc/audit:/host/etc/audit:ro
     ports:
       - "24224:24224"
     restart: unless-stopped
+    depends_on:
+      fix-audit-perm:
+        condition: service_healthy
 
   postfix:
     build: ./postfix
@@ -24,13 +30,11 @@ services:
     volumes:
       - maildir:/opt/mail
       - postfixlogs:/var/log
+      - ./:/hostwork:ro
     ports:
       - "25:25"
     healthcheck:
       test: ["CMD-SHELL", "pidof master >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
     restart: unless-stopped
 
   mail-agent:
@@ -78,14 +82,97 @@ services:
       - td-agent
     restart: unless-stopped
 
+  fix-audit-perm:
+    image: alpine:3.20
+    container_name: fix-audit-perm
+    user: "0:0"
+    volumes:
+      - /var/log/audit:/host/var/log/audit
+      - /etc/audit:/host/etc/audit
+      - /etc/group:/host/etc/group:ro
+      - /etc/logrotate.d:/host/etc/logrotate.d
+      - initstate:/state           # ★ 센티넬용
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /state/fix_audit_perm.ok ]"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+      start_period: 1s
+    command:
+      - sh
+      - -lc
+      - |
+        set -euo pipefail
+
+        echo "[fix-audit-perm] start"
+
+        # 그룹: td-agent 있으면 사용, 없으면 root
+        if awk -F: '$$1=="td-agent"{exit 0} END{exit 1}' /host/etc/group; then
+          GROUP_NAME="td-agent"
+        else
+          echo "[fix-audit-perm] INFO: host에 'td-agent' 그룹 없음 → root 사용"
+          GROUP_NAME="root"
+        fi
+        echo "[fix-audit-perm] use group=$${GROUP_NAME}"
+
+        # 퍼미션 정리
+        chown root:"$${GROUP_NAME}" /host/var/log/audit || true
+        chmod 750 /host/var/log/audit || true
+        if [ -f /host/var/log/audit/audit.log ]; then
+          chown root:"$${GROUP_NAME}" /host/var/log/audit/audit.log || true
+          chmod 640 /host/var/log/audit/audit.log || true
+        fi
+        chown root:"$${GROUP_NAME}" /host/etc/audit || true
+        chmod 750 /host/etc/audit || true
+
+        # logrotate 패치
+        CREATE_LINE="    create 0640 root $${GROUP_NAME}"
+        patch_logrotate() {
+          f="$1"; [ -f "$$f" ] || return 1
+          cp -f "$$f" "$$f.bak.$(date +%s)" || true
+          awk -v cline="$${CREATE_LINE}" '
+            /^[[:space:]]*\/var\/log\/audit\/audit\.log[[:space:]]*\{/ { inblk=1 }
+            {
+              if (inblk && $$1=="create") { $$0=cline; changed=1 }
+              print
+              if (inblk && /^\}/) {
+                if (!changed) { print cline }
+                inblk=0; changed=0
+              }
+            }
+          ' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"
+          echo "[fix-audit-perm] Patched logrotate: $$f"
+          return 0
+        }
+        patch_logrotate /host/etc/logrotate.d/audit || patch_logrotate /host/etc/logrotate.d/auditd || {
+          printf '%s\n' \
+            '/var/log/audit/audit.log {' \
+            '    daily' \
+            '    rotate 7' \
+            '    missingok' \
+            '    compress' \
+            '    delaycompress' \
+            '    notifempty' \
+            "$${CREATE_LINE}" \
+            '    postrotate' \
+            '        /usr/sbin/service auditd reload > /dev/null 2>&1 || true' \
+            '    endscript' \
+            '}' > /host/etc/logrotate.d/auditd
+          echo "[fix-audit-perm] Created default /etc/logrotate.d/auditd"
+        }
+
+        # ★ 센티넬 찍고 계속 살아있기(health=healthy 유지)
+        touch /state/fix_audit_perm.ok
+        echo "[fix-audit-perm] OK"
+        tail -f /dev/null
+    restart: unless-stopped
+
   fix-mail-perm:
     build: ./fix-mail-perm
     container_name: fix-mail-perm
-    # Postfix가 쓰는 Maildir 볼륨을 그대로 공유해야 chmod가 적용됨
     volumes:
       - maildir:/opt/mail/Maildir
     restart: unless-stopped
-    # (선택) postfix가 Maildir을 쓴다면 의존성
     depends_on:
       - postfix
 
@@ -95,6 +182,8 @@ services:
     depends_on:
       postfix:
         condition: service_healthy
+    environment:
+      POSTFIX_CTN: "log-collect-postfix"
     command:
       - sh
       - -lc
@@ -120,10 +209,12 @@ services:
         echo "Installed /usr/local/bin/mail -> docker exec -i \${POSTFIX_CTN:-log-collect-postfix} /usr/bin/mailx"
     volumes:
       - /usr/local/bin:/hostbin
+      - ${HOME}/.local/bin:/hostuserbin
       - /var/run/docker.sock:/var/run/docker.sock:ro
     restart: "no"
 
 volumes:
+    initstate:
     tdpos:
       name: logcollect_tdpos
     maildir: {}

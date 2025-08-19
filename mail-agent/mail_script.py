@@ -100,16 +100,7 @@ def _x_original_to_from_headers(msg) -> set[str]:
 # ★ 추가: Message-Id가 없을 때를 포함한 “중복 판별 키”
 def _canonical_msg_key(msg, eml_path: Path) -> str:
     mid = _extract_msgid(msg)
-    if mid:
-        return "mid:" + mid.lower()
-    src = "|".join([
-        ",".join(_header_emails_only(msg, 'From')),
-        ",".join(_header_emails_only(msg, 'To')),
-        ",".join(_header_emails_only(msg, 'Cc')),
-        (msg.get('Subject','') or '').strip(),
-        str(eml_path.stat().st_size)
-    ])
-    return "sha1:" + hashlib.sha1(src.encode('utf-8', errors='ignore')).hexdigest()
+    return ("mid:" + mid.lower()) if mid else ""
 
 def _rcpts_from_local_copies_by_mid(message_id: str) -> set[str]:
     if not message_id:
@@ -132,6 +123,85 @@ def _rcpts_from_local_copies_by_mid(message_id: str) -> set[str]:
             continue
     return rcpts
 
+HEADER_RE = re.compile(r'^(MIME-Version|Content-Type|Content-Transfer-Encoding|Subject|From|To|Cc|Bcc)\b', re.I)
+FNAME_RE  = re.compile(r'^[^<>:"\\|?*\r\n]+(?:\.[A-Za-z0-9]{1,16})$')
+
+def get_body_text(msg) -> str:
+    """예외 없이 text/plain 본문만 모아 문자열 반환"""
+    try:
+        parts = []
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.is_multipart():
+                    continue
+                if (part.get_content_type() or "").lower() == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload is None:
+                        raw = part.get_payload()
+                        if isinstance(raw, str):
+                            parts.append(raw)
+                            continue
+                        payload = b""
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        parts.append(payload.decode(charset, errors="replace"))
+                    except Exception:
+                        parts.append(payload.decode("utf-8", errors="replace"))
+        else:
+            if (msg.get_content_type() or "").lower() == "text/plain":
+                payload = msg.get_payload(decode=True)
+                if payload is None:
+                    raw = msg.get_payload()
+                    return raw if isinstance(raw, str) else ""
+                charset = msg.get_content_charset() or "utf-8"
+                try:
+                    return payload.decode(charset, errors="replace")
+                except Exception:
+                    return payload.decode("utf-8", errors="replace")
+        return "\n".join(parts).strip()
+    except Exception as e:
+        print("WARN get_body_text:", e)
+        return ""
+
+def _attachment_names_from_content_prefix(content: str) -> list[str]:
+    """content 선두에서 MIME 헤더 직전까지 파일명처럼 보이는 줄만 추출"""
+    if not content:
+        return []
+    names, seen = [], set()
+    for raw in content.splitlines():
+        s = raw.strip().strip("'").strip('"')
+        if not s:
+            continue
+        if HEADER_RE.match(s):
+            break
+        if len(s) > 255:
+            continue
+        if FNAME_RE.match(s):
+            if s not in seen:
+                names.append(s); seen.add(s)
+    return names
+
+def count_attachments_mime(msg) -> int:
+    """MIME 구조 기반 첨부 카운트"""
+    cnt = 0
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.is_multipart():
+                    continue
+                disp = (part.get_content_disposition() or "").lower()
+                has_name = bool(part.get_filename() or part.get_param('name', header='content-type'))
+                if disp == "attachment" or has_name:
+                    cnt += 1
+        else:
+            disp = (msg.get_content_disposition() or "").lower()
+            has_name = bool(msg.get_filename() or msg.get_param('name', header='content-type'))
+            if disp == "attachment" or has_name:
+                cnt = 1
+    except Exception as e:
+        print("WARN count_attachments_mime:", e)
+    return cnt
+
 def _first_header_email(msg, field: str) -> str:
     vals = msg.get_all(field, []) or []
     for _, addr in getaddresses(vals):
@@ -139,10 +209,14 @@ def _first_header_email(msg, field: str) -> str:
             return addr.strip().lower()
     return ""
 
-if processed_file.exists():
-    with processed_file.open('r') as f:
-        already_parsed = set(line.strip() for line in f if line.strip())
-else:
+try:
+    if processed_file.exists():
+        with processed_file.open('r') as f:
+            already_parsed = set(line.strip() for line in f if line.strip())
+    else:
+        already_parsed = set()
+except Exception as e:
+    print("WARN processed_file:", e)
     already_parsed = set()
 
 # 파일 순회
@@ -157,7 +231,7 @@ for eml_path in sorted(NEW_DIR.glob('*')):
 
         # ★ 중복 방지: 같은 메시지면 스킵(읽음 처리만)
         key = _canonical_msg_key(msg, eml_path)
-        if key in processed_msgids:
+        if key and (key in processed_msgids):
             # 파일은 읽음으로만 이동
             with processed_file.open('a') as pf:
                 pf.write(fname + '\n'); pf.flush(); os.fsync(pf.fileno())
@@ -192,6 +266,11 @@ for eml_path in sorted(NEW_DIR.glob('*')):
         ARCHIVE_ADDR = "archive@localhost"  # always_bcc 로 추가된 주소
         bcc_restored = sorted(addr for addr in (all_rcpts - to_cc) if addr != ARCHIVE_ADDR)
 
+        body_text = get_body_text(msg)
+        att_from_body = len(_attachment_names_from_content_prefix(body_text))
+        att_mime = count_attachments_mime(msg)
+        attach_cnt = max(att_mime, att_from_body)
+
         log = {
             'employee_id': os.environ.get("EMPLOYEE_ID") or getpass.getuser(),
             'pc_id': os.environ.get("PC_ID") or socket.gethostname(),
@@ -201,20 +280,22 @@ for eml_path in sorted(NEW_DIR.glob('*')):
             'to': _header_emails_only(msg, 'To'),
             'cc': _header_emails_only(msg, 'Cc'),
             'bcc': bcc_restored,
-            'subject': msg.get('Subject', ''),
-            'content': get_body(),
-            'attachment': count_attachments(),
+            'attachment': attach_cnt,
             'size': eml_path.stat().st_size
         }
 
-        event.Event('mail', log)
+        try:
+            event.Event('mail', log)
+        except Exception as ee:
+            print("ERROR send fluentd:", ee, "payload=", json.dumps(log, ensure_ascii=False)[:512])
 
         # 처리 완료 기록 (파일/메시지 키 모두)
         with processed_file.open('a') as pf:
             pf.write(fname + '\n'); pf.flush(); os.fsync(pf.fileno())
-        with processed_msgids_file.open('a') as kf:
-            kf.write(key + '\n'); kf.flush(); os.fsync(kf.fileno())
-        processed_msgids.add(key)
+        if key:
+            with processed_msgids_file.open('a') as kf:
+                kf.write(key + '\n'); kf.flush(); os.fsync(kf.fileno())
+            processed_msgids.add(key)
 
         # 읽음으로 이동
         cur_name = f"{fname}:2,S"

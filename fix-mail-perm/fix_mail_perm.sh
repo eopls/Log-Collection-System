@@ -2,7 +2,6 @@
 set -euo pipefail
 BASE="/opt/mail/Maildir"
 
-# inotify-tools 필요
 /usr/bin/inotifywait -m -r -e create -e moved_to -e close_write \
   --format '%w%f' "$BASE" \
 | while IFS= read -r f; do
