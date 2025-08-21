@@ -213,6 +213,160 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     restart: "no"
 
+  sudo-securepath-setup:
+    image: debian:stable-slim
+    container_name: sudo-securepath-setup
+    restart: "no"
+    volumes:
+      - /etc/sudoers:/host-etc/sudoers
+      - /etc/sudoers.d:/host-etc-sudoers.d
+    command:
+      - sh
+      - -lc
+      - |-
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update >/dev/null
+        apt-get install -y --no-install-recommends sudo >/dev/null
+
+        mkdir -p /host-etc-sudoers.d
+
+        extract() {
+          grep -hE '^[[:space:]]*Defaults.*secure_path="[^"]+"' "$$@" 2>/dev/null \
+          | tail -n1 | sed -E 's/.*secure_path="([^"]+)".*/\1/'
+        }
+        CUR="$$(extract /host-etc/sudoers /host-etc-sudoers.d/* || true)"
+        [ -n "$$CUR" ] || CUR="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        NEW="/usr/local/sbin"
+        IFS=:; for p in $$CUR; do
+          [ -n "$$p" ] || continue
+          case ":$$NEW:" in *":$$p:"*) ;; *) NEW="$$NEW:$$p";; esac
+        done; unset IFS
+
+        [ -n "$$NEW" ] || NEW="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+        cat > /host-etc-sudoers.d/99-securepath-local <<EOF
+        # added by docker service sudo-securepath-setup
+        Defaults secure_path="$$NEW"
+        EOF
+
+        visudo -q -cf /host-etc-sudoers.d/99-securepath-local
+
+        if ! grep -q '^[[:space:]]*#includedir[[:space:]]\+/etc/sudoers.d' /host-etc/sudoers; then
+          cp -a /host-etc/sudoers "/host-etc-sudoers.bak.$$(date +%s)"
+          printf '\n# added by docker service sudo-securepath-setup\n#includedir /etc/sudoers.d\n' >> /host-etc/sudoers
+        fi
+
+        echo "secure_path set to: $$NEW"
+        echo "Verify on host: sudo -V | grep -i secure_path"
+
+  install-umount-wrapper:
+    image: bash:5.2
+    container_name: install-umount-wrapper
+    restart: "no"
+    depends_on:
+      - sudo-securepath-setup
+    network_mode: "none"
+    volumes:
+      - /usr/local/sbin:/host-sbin
+      - /usr/local/lib:/host-lib
+      - ./auto-device-watch/auto_device_watch.sh:/src/auto_device_watch.sh:ro
+    command:
+      - sh
+      - -lc
+      - |-
+        set -euo pipefail
+
+        install -d /host-sbin /host-lib
+        install -Dm755 /src/auto_device_watch.sh /host-lib/auto_device_watch.sh
+
+        if [ -f /host-sbin/umount ]; then
+          if ! grep -q "auto_device_watch wrapper" /host-sbin/umount 2>/dev/null; then
+            echo "Backing up existing /usr/local/sbin/umount -> /usr/local/sbin/umount.bak"
+            cp -f /host-sbin/umount /host-sbin/umount.bak || true
+          fi
+        fi
+
+        cat >/host-sbin/umount << 'EOF'
+        #!/bin/bash
+        # auto_device_watch wrapper
+        set -u
+
+        REAL_UMOUNT="/usr/bin/umount"
+        [ -x "$$REAL_UMOUNT" ] || REAL_UMOUNT="/bin/umount"
+
+        NO_AUTO="$${NO_AUTO_FILE:-/run/auto_device_watch.NO_AUTO}"
+        CLEANER="$${CLEANER:-/usr/local/lib/auto_device_watch.sh}"
+
+        cleanup() { rm -f "$$NO_AUTO" 2>/dev/null || true; }
+        trap cleanup EXIT
+
+        targets=()
+        for a in "$$@"; do
+          case "$$a" in -*) ;; *) targets+=("$$a");; esac
+        done
+
+        touch "$$NO_AUTO" 2>/dev/null || true
+
+        set +e
+        "$$REAL_UMOUNT" "$$@"
+        rc=$$?
+        set -e
+
+        if [ -e "$$CLEANER" ] && [ $${#targets[@]} -gt 0 ]; then
+          t_clean=()
+          for t in "$${targets[@]}"; do
+            case "$$t" in
+              /media/*|/dev/loop*|*.img) t_clean+=("$$t");;
+            esac
+          done
+          if [ $${#t_clean[@]} -gt 0 ]; then
+            USER_NAME="$${SUDO_USER:-$$USER}" bash "$$CLEANER" umount-clean "$${t_clean[@]}"
+          fi
+        fi
+
+        exit "$$rc"
+        EOF
+
+        chmod 755 /host-sbin/umount
+        echo "Installed: /usr/local/sbin/umount (wrapper) and /usr/local/lib/auto_device_watch.sh"
+
+  auto-device-watch:
+    build: ./auto-device-watch
+    container_name: auto-device-watch
+    user: "0:0"
+    security_opt:
+    - apparmor=unconfined
+    - seccomp=unconfined
+    environment:
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      USER_NAME: "${EMPLOYEE_ID}"
+      AUTO_MOUNT: "1"
+      MOUNT_IN_HOST: "1"
+      AUDIT_KEY: "usb_copy"
+      AUDIT_COMM: "cp"
+      TZ: "${TZ}"
+    pid: "host"
+    cap_add:
+      - SYS_ADMIN                    # mount 수행
+      - AUDIT_CONTROL                # auditctl 권한
+    privileged: true
+    volumes:
+      - type: bind
+        source: /home
+        target: /home
+        bind: { propagation: rshared }
+      - type: bind
+        source: /media
+        target: /media
+        bind: { propagation: rshared }
+      - /etc/audit:/host/etc/audit
+    restart: unless-stopped
+    depends_on:
+      fix-audit-perm:
+        condition: service_healthy
+
 volumes:
     initstate:
     tdpos:
