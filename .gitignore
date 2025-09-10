@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.env/
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Etc
+*.swp
+
+mitmproxy/

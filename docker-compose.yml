@@ -1,0 +1,216 @@
+version: "3.8"
+
+services:
+  td-agent:
+    image: yz025147/log-collect-td-agent:latest
+    container_name: log-collect-td-agent
+    user: "0:0"
+    environment:
+      API_BASE: "${API_BASE}"
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      PC_ID: "${PC_ID}"
+      TZ: "${TZ}"
+    volumes:
+      - tdpos:/var/log/td-agent
+      - /var/log/audit:/host/var/log/audit:ro
+      - /etc/audit:/host/etc/audit:ro
+    ports:
+      - "24224:24224"
+    restart: unless-stopped
+    depends_on:
+      fix-audit-perm:
+        condition: service_healthy
+
+  postfix:
+    image: yz025147/log-collect-postfix:latest
+    container_name: log-collect-postfix
+    environment:
+      TZ: "${TZ}"
+    volumes:
+      - maildir:/opt/mail
+      - postfixlogs:/var/log
+      - ./:/hostwork:ro
+    ports:
+      - "25:25"
+    healthcheck:
+      test: ["CMD-SHELL", "pidof master >/dev/null 2>&1 || exit 1"]
+    restart: unless-stopped
+
+  mail-agent:
+    image: yz025147/log-collect-mail-agent:latest
+    container_name: log-collect-mail-agent
+    environment:
+      API_BASE: "${API_BASE}"
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      PC_ID: "${PC_ID}"
+      TZ: "${TZ}"
+      MAILDIR_PATH: "/opt/mail/Maildir"
+    volumes:
+      - maildir:/opt/mail
+      - postfixlogs:/host/var/log:ro
+      - mailagentstate:/var/lib/mail-agent
+    depends_on:
+      td-agent:
+        condition: service_started
+      postfix:
+        condition: service_healthy
+    restart: unless-stopped
+    command: /bin/sh -c 'while :; do python /app/mail_script.py; sleep 5; done'
+
+  proxy-agent:
+    image: yz025147/log-collect-proxy-agent:latest
+    container_name: log-collect-proxy-agent
+    environment:
+      API_BASE: "${API_BASE}"
+      EMPLOYEE_ID: "${EMPLOYEE_ID}"
+      PC_ID: "${PC_ID}"
+      TZ: "${TZ}"
+    volumes:
+      - ./mitmproxy:/root/.mitmproxy
+    command: >
+      sh -lc 'umask 002; exec mitmdump -p 8080 -s /app/email_script.py -s /app/http_script.py --set confdir=/root/.mitmproxy --set termlog_verbosity=info --set flow_detail=2'
+    ports:
+      - "8081:8080"
+    depends_on:
+      - td-agent
+    restart: unless-stopped
+
+  fix-audit-perm:
+    image: alpine:3.20
+    container_name: fix-audit-perm
+    user: "0:0"
+    volumes:
+      - /var/log/audit:/host/var/log/audit
+      - /etc/audit:/host/etc/audit
+      - /etc/group:/host/etc/group:ro
+      - /etc/logrotate.d:/host/etc/logrotate.d
+      - initstate:/state
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /state/fix_audit_perm.ok ]"]
+      interval: 2s
+      timeout: 1s
+      retries: 15
+      start_period: 1s
+    command:
+      - sh
+      - -lc
+      - |
+        set -euo pipefail
+
+        echo "[fix-audit-perm] start"
+
+        # 그룹: td-agent 있으면 사용, 없으면 root
+        if awk -F: '$$1=="td-agent"{exit 0} END{exit 1}' /host/etc/group; then
+          GROUP_NAME="td-agent"
+        else
+          echo "[fix-audit-perm] INFO: host에 'td-agent' 그룹 없음 → root 사용"
+          GROUP_NAME="root"
+        fi
+        echo "[fix-audit-perm] use group=$${GROUP_NAME}"
+
+        # 퍼미션 정리
+        chown root:"$${GROUP_NAME}" /host/var/log/audit || true
+        chmod 750 /host/var/log/audit || true
+        if [ -f /host/var/log/audit/audit.log ]; then
+          chown root:"$${GROUP_NAME}" /host/var/log/audit/audit.log || true
+          chmod 640 /host/var/log/audit/audit.log || true
+        fi
+        chown root:"$${GROUP_NAME}" /host/etc/audit || true
+        chmod 750 /host/etc/audit || true
+
+        # logrotate 패치
+        CREATE_LINE="    create 0640 root $${GROUP_NAME}"
+        patch_logrotate() {
+          f="$1"; [ -f "$$f" ] || return 1
+          cp -f "$$f" "$$f.bak.$(date +%s)" || true
+          awk -v cline="$${CREATE_LINE}" '
+            /^[[:space:]]*\/var\/log\/audit\/audit\.log[[:space:]]*\{/ { inblk=1 }
+            {
+              if (inblk && $$1=="create") { $$0=cline; changed=1 }
+              print
+              if (inblk && /^\}/) {
+                if (!changed) { print cline }
+                inblk=0; changed=0
+              }
+            }
+          ' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"
+          echo "[fix-audit-perm] Patched logrotate: $$f"
+          return 0
+        }
+        patch_logrotate /host/etc/logrotate.d/audit || patch_logrotate /host/etc/logrotate.d/auditd || {
+          printf '%s\n' \
+            '/var/log/audit/audit.log {' \
+            '    daily' \
+            '    rotate 7' \
+            '    missingok' \
+            '    compress' \
+            '    delaycompress' \
+            '    notifempty' \
+            "$${CREATE_LINE}" \
+            '    postrotate' \
+            '        /usr/sbin/service auditd reload > /dev/null 2>&1 || true' \
+            '    endscript' \
+            '}' > /host/etc/logrotate.d/auditd
+          echo "[fix-audit-perm] Created default /etc/logrotate.d/auditd"
+        }
+
+        # ★ 센티넬 찍고 계속 살아있기(health=healthy 유지)
+        touch /state/fix_audit_perm.ok
+        echo "[fix-audit-perm] OK"
+        tail -f /dev/null
+    restart: unless-stopped
+
+  fix-mail-perm:
+    image: yz025147/log-collect-fix-mail-perm:latest
+    container_name: fix-mail-perm
+    volumes:
+      - maildir:/opt/mail/Maildir
+    restart: unless-stopped
+    depends_on:
+      - postfix
+
+  cli-wrapper:
+    image: alpine:3.20
+    container_name: log-collect-cli-wrapper
+    depends_on:
+      postfix:
+        condition: service_healthy
+    environment:
+      POSTFIX_CTN: "log-collect-postfix"
+    command:
+      - sh
+      - -lc
+      - |-
+        set -e
+        # 시스템 PATH에 이미 들어있는 /usr/local/bin 에 설치
+        install -d /hostbin
+
+        # 기존 mail이 래퍼가 아니면 백업
+        if [ -f /hostbin/mail ] && ! grep -q 'docker exec -i .* /usr/bin/mailx' /hostbin/mail 2>/dev/null; then
+          cp -f /hostbin/mail "/hostbin/mail.bak.$(date +%s)"
+        fi
+
+        # mailx 래퍼 (★ compose가 $를 치환하지 못하게 $를 $$로 이스케이프)
+        cat >/hostbin/mail <<'EOS'
+        #!/usr/bin/env sh
+        set -eu
+        CTN="$${POSTFIX_CTN:-log-collect-postfix}"
+        exec docker exec -i "$$CTN" /usr/bin/mailx "$$@"
+        EOS
+        chmod +x /hostbin/mail
+
+        echo "Installed /usr/local/bin/mail -> docker exec -i \${POSTFIX_CTN:-log-collect-postfix} /usr/bin/mailx"
+    volumes:
+      - /usr/local/bin:/hostbin
+      - ${HOME}/.local/bin:/hostuserbin
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: "no"
+
+volumes:
+    initstate:
+    tdpos:
+      name: logcollect_tdpos
+    maildir: {}
+    postfixlogs:
+      name: logcollect_postfixlogs
+    mailagentstate: {}
