@@ -1,3 +1,0 @@
-mitmproxy==10.3.0
-fluent-logger==0.10.0
-beautifulsoup4==4.12.3
